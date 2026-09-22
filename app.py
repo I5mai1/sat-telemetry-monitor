@@ -13,16 +13,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import threading
 from collections import deque
 from datetime import datetime, timezone
 
 import altair as alt
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
 import websockets
 
 from alarms import AlarmEvent, Severity, evaluate_frame
+from orbit import GROUND_TRACK_WINDOW_MINUTES, OrbitPropagator, footprint_polygon
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,6 +38,13 @@ RECONNECT_DELAY_SECONDS: float = 2.0
 MAX_FRAME_HISTORY: int = 180
 MAX_ALARM_HISTORY: int = 200
 REFRESH_INTERVAL: str = "1s"
+COMMAND_POLL_INTERVAL_SECONDS: float = 0.2
+
+TELECOMMANDS: dict = {
+    "RESET_AOCS": "🔄 Reset AOCS Wheels",
+    "SET_SAFE_MODE": "🛡️ Enter Safe Mode",
+    "TOGGLE_HEATER": "🌡️ Toggle Thermal Control",
+}
 
 # Colors below come from the project's validated status/categorical palette.
 # Categorical slots 1/2/3 (front-loaded, CVD-safe as a set) — one per chart.
@@ -47,6 +57,18 @@ STATUS_GOOD: str = "#0ca30c"
 STATUS_WARNING: str = "#fab219"
 STATUS_CRITICAL: str = "#d03b3b"
 
+# Ground station: GSOC (German Space Operations Center), Oberpfaffenhofen.
+GROUND_STATION_NAME: str = "GSOC — Oberpfaffenhofen"
+GROUND_STATION_LAT: float = 48.08
+GROUND_STATION_LON: float = 11.28
+GROUND_STATION_MIN_ELEVATION_DEG: float = 10.0
+
+# Orbit map colors — categorical slots 4 (amber) and 7 (violet), reserved
+# status colors are not reused here since map entities are not alarm states.
+COLOR_TRACK_PAST_HEX: str = "#9085e9"
+COLOR_TRACK_FUTURE_HEX: str = "#eda100"
+COLOR_GROUND_STATION_HEX: str = "#1baf7a"
+
 
 class TelemetryStore:
     """Thread-safe rolling buffer shared between the WS client thread and the UI."""
@@ -56,6 +78,8 @@ class TelemetryStore:
         self._frames: deque = deque(maxlen=max_frames)
         self._alarms: deque = deque(maxlen=max_alarms)
         self.status: str = "CONNECTING"
+        self.command_queue: queue.Queue = queue.Queue()
+        self._last_ack: dict | None = None
 
     def add_frame(self, frame: dict) -> None:
         with self._lock:
@@ -75,6 +99,41 @@ class TelemetryStore:
         with self._lock:
             return list(self._frames), list(self._alarms), self.status
 
+    def enqueue_command(self, command: str) -> None:
+        """Called from the Streamlit UI thread to uplink a telecommand."""
+        self.command_queue.put({"command": command})
+
+    def set_last_ack(self, ack: dict) -> None:
+        with self._lock:
+            self._last_ack = ack
+
+    def pop_last_ack(self) -> dict | None:
+        with self._lock:
+            ack, self._last_ack = self._last_ack, None
+            return ack
+
+
+async def _receive_loop(store: TelemetryStore, connection) -> None:
+    async for raw_message in connection:
+        message = json.loads(raw_message)
+        if message.get("type") == "TC_ACK":
+            store.set_last_ack(message)
+            logger.info("Received TC_ACK: %s -> %s (%s)", message.get("command"), message.get("status"), message.get("detail"))
+        else:
+            store.add_frame(message)
+            store.add_alarms(evaluate_frame(message))
+
+
+async def _command_sender_loop(store: TelemetryStore, connection) -> None:
+    while True:
+        try:
+            command = store.command_queue.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(COMMAND_POLL_INTERVAL_SECONDS)
+            continue
+        await connection.send(json.dumps(command))
+        logger.info("Uplinked telecommand: %s", command.get("command"))
+
 
 async def _stream_loop(store: TelemetryStore, uri: str) -> None:
     while True:
@@ -83,10 +142,17 @@ async def _stream_loop(store: TelemetryStore, uri: str) -> None:
             async with websockets.connect(uri) as connection:
                 store.set_status("CONNECTED")
                 logger.info("Dashboard connected to telemetry stream at %s", uri)
-                async for raw_frame in connection:
-                    frame = json.loads(raw_frame)
-                    store.add_frame(frame)
-                    store.add_alarms(evaluate_frame(frame))
+                receive_task = asyncio.create_task(_receive_loop(store, connection))
+                sender_task = asyncio.create_task(_command_sender_loop(store, connection))
+                done, pending = await asyncio.wait(
+                    {receive_task, sender_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None and not isinstance(exc, websockets.ConnectionClosed):
+                        raise exc
         except (OSError, websockets.WebSocketException) as exc:
             store.set_status("DISCONNECTED")
             logger.warning(
@@ -109,6 +175,11 @@ def get_store() -> TelemetryStore:
     store = TelemetryStore()
     _start_background_client(store, WS_URI)
     return store
+
+
+@st.cache_resource
+def get_orbit_propagator() -> OrbitPropagator:
+    return OrbitPropagator()
 
 
 def _inject_css() -> None:
@@ -222,10 +293,155 @@ def _style_alarm_row(row: pd.Series) -> list:
     return [f"background-color: {background}"] * len(row)
 
 
+def _rgba(hex_color: str, alpha: int = 255) -> list:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+    return [r, g, b, alpha]
+
+
+def _split_track(samples: list, keep) -> list:
+    """Split (offset, OrbitState) samples into antimeridian-safe [lon, lat] paths."""
+    segments: list = []
+    current: list = []
+    prev_lon = None
+    for offset, state in samples:
+        if not keep(offset):
+            continue
+        lon = state.longitude_deg
+        if prev_lon is not None and abs(lon - prev_lon) > 180.0:
+            if len(current) > 1:
+                segments.append(current)
+            current = []
+        current.append([lon, state.latitude_deg])
+        prev_lon = lon
+    if len(current) > 1:
+        segments.append(current)
+    return segments
+
+
+def render_orbit_view(latest: dict) -> None:
+    st.subheader("2D Orbit & Ground Track")
+    st.caption(
+        f"Lat {latest['latitude_deg']:.2f}° · Lon {latest['longitude_deg']:.2f}° · "
+        f"Alt {latest['altitude_km']:.1f} km · Speed {latest['orbital_speed_km_s']:.2f} km/s"
+    )
+
+    propagator = get_orbit_propagator()
+    track = propagator.ground_track(window_minutes=GROUND_TRACK_WINDOW_MINUTES)
+    past_segments = _split_track(track, lambda offset: offset <= 0)
+    future_segments = _split_track(track, lambda offset: offset >= 0)
+
+    footprint = footprint_polygon(
+        GROUND_STATION_LAT,
+        GROUND_STATION_LON,
+        latest["altitude_km"],
+        GROUND_STATION_MIN_ELEVATION_DEG,
+    )
+
+    layers = [
+        pdk.Layer(
+            "PolygonLayer",
+            data=[{"polygon": footprint}],
+            get_polygon="polygon",
+            filled=True,
+            stroked=True,
+            get_fill_color=_rgba(COLOR_GROUND_STATION_HEX, 40),
+            get_line_color=_rgba(COLOR_GROUND_STATION_HEX, 200),
+            get_line_width=2,
+            line_width_min_pixels=1,
+        ),
+        pdk.Layer(
+            "PathLayer",
+            data=[{"path": segment} for segment in past_segments],
+            get_path="path",
+            get_color=_rgba(COLOR_TRACK_PAST_HEX, 200),
+            get_width=2,
+            width_min_pixels=2,
+        ),
+        pdk.Layer(
+            "PathLayer",
+            data=[{"path": segment} for segment in future_segments],
+            get_path="path",
+            get_color=_rgba(COLOR_TRACK_FUTURE_HEX, 230),
+            get_width=2,
+            width_min_pixels=2,
+        ),
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=[{"position": [GROUND_STATION_LON, GROUND_STATION_LAT], "name": GROUND_STATION_NAME}],
+            get_position="position",
+            get_fill_color=_rgba(COLOR_GROUND_STATION_HEX),
+            get_radius=60000,
+            radius_min_pixels=6,
+            radius_max_pixels=10,
+            pickable=True,
+        ),
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=[{"position": [latest["longitude_deg"], latest["latitude_deg"]], "name": "Satellite"}],
+            get_position="position",
+            get_fill_color=_rgba("#ffffff"),
+            get_line_color=[0, 0, 0, 255],
+            stroked=True,
+            line_width_min_pixels=1,
+            get_radius=80000,
+            radius_min_pixels=7,
+            radius_max_pixels=12,
+            pickable=True,
+        ),
+    ]
+
+    view_state = pdk.ViewState(
+        latitude=latest["latitude_deg"],
+        longitude=latest["longitude_deg"],
+        zoom=1.2,
+        pitch=0,
+    )
+
+    deck = pdk.Deck(
+        map_provider="carto",
+        map_style="dark",
+        initial_view_state=view_state,
+        layers=layers,
+        tooltip={"text": "{name}"},
+    )
+    st.pydeck_chart(deck, width="stretch")
+    st.caption(
+        f"Ground track: ±{GROUND_TRACK_WINDOW_MINUTES} min (violet = past, amber = predicted) · "
+        f"Ground station: {GROUND_STATION_NAME} ({GROUND_STATION_LAT}°N, {GROUND_STATION_LON}°E) · "
+        f"{GROUND_STATION_MIN_ELEVATION_DEG:.0f}° min-elevation footprint"
+    )
+
+
+def render_telecommand_console(store: TelemetryStore) -> None:
+    with st.sidebar:
+        st.header("📡 Telecommand Uplink Console")
+        st.caption(f"Uplink: `{WS_URI}`")
+
+        for command, label in TELECOMMANDS.items():
+            if st.button(label, width="stretch", key=f"tc_{command}"):
+                store.enqueue_command(command)
+                st.toast(f"{command} uplinked — awaiting ACK…", icon="📡")
+
+        ack = store.pop_last_ack()
+        if ack is not None:
+            st.session_state["last_tc_ack"] = ack
+            icon = "✅" if ack["status"] == "EXECUTED" else "⚠️"
+            st.toast(f"{ack['command']} — {ack['status']}", icon=icon)
+
+        last_ack = st.session_state.get("last_tc_ack")
+        if last_ack is not None:
+            icon = "✅" if last_ack["status"] == "EXECUTED" else "⚠️"
+            ack_time = datetime.fromtimestamp(last_ack["timestamp"], tz=timezone.utc).strftime("%H:%M:%S")
+            st.success(f"{icon} **{last_ack['command']}** — {last_ack['status']} @ {ack_time} UTC  \n{last_ack['detail']}")
+
+
 @st.fragment(run_every=REFRESH_INTERVAL)
 def render_dashboard() -> None:
     store = get_store()
     frames, alarm_history, status = store.snapshot()
+
+    render_telecommand_console(store)
 
     status_captions = {
         "CONNECTED": "🟢 Connected to telemetry stream",
@@ -293,20 +509,23 @@ def render_dashboard() -> None:
         st.markdown("**Power — Battery Voltage (V)**")
         st.altair_chart(
             _line_chart(df, "battery_voltage_v", "Voltage (V)", COLOR_BATTERY),
-            use_container_width=True,
+            width="stretch",
         )
     with chart_col2:
         st.markdown("**AOCS — Reaction Wheel Speed (RPM)**")
         st.altair_chart(
             _line_chart(df, "reaction_wheel_speed_rpm", "Speed (RPM)", COLOR_WHEEL),
-            use_container_width=True,
+            width="stretch",
         )
     with chart_col3:
         st.markdown("**Thermal — Bus Temperature (°C)**")
         st.altair_chart(
             _line_chart(df, "bus_temperature_c", "Temp (°C)", COLOR_TEMP),
-            use_container_width=True,
+            width="stretch",
         )
+
+    st.divider()
+    render_orbit_view(latest)
 
     st.divider()
     st.subheader("Active Out-of-Limits Alarm Matrix")
@@ -316,7 +535,7 @@ def render_dashboard() -> None:
         alarm_df = _alarm_dataframe(alarm_history)
         st.dataframe(
             alarm_df.style.apply(_style_alarm_row, axis=1),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
